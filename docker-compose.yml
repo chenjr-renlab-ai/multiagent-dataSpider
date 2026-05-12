@@ -1,0 +1,166 @@
+version: "3.9"
+
+# -----------------------------------------------------------------------
+# MultiAgent DataSpider — Docker Compose
+# -----------------------------------------------------------------------
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  networks:
+    - spider-net
+  env_file:
+    - .env
+
+x-worker-build: &worker-build
+  context: .
+  dockerfile: Dockerfile
+
+# -----------------------------------------------------------------------
+services:
+
+  # --- Infrastructure ---------------------------------------------------
+
+  redis:
+    image: redis:7-alpine
+    container_name: spider-redis
+    restart: unless-stopped
+    networks:
+      - spider-net
+    volumes:
+      - redis_data:/data
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --save 60 1
+      --loglevel notice
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: spider-postgres
+    restart: unless-stopped
+    networks:
+      - spider-net
+    environment:
+      POSTGRES_DB: spiderdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d spiderdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # --- Application Services ----------------------------------------------
+
+  api-gateway:
+    <<: *service-defaults
+    container_name: spider-api-gateway
+    build: *worker-build
+    command: python -m uvicorn api_gateway.main:app --host 0.0.0.0 --port 8080 --workers 1
+    ports:
+      - "8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: api-gateway
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  coordinator:
+    <<: *service-defaults
+    build: *worker-build
+    command: python -m coordinator.main
+    deploy:
+      replicas: 1
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: coordinator
+
+  crawler:
+    <<: *service-defaults
+    build: *worker-build
+    command: python -m crawler.main
+    deploy:
+      replicas: 3
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: crawler
+      WORKER_TIER: "2"
+
+  processor:
+    <<: *service-defaults
+    build: *worker-build
+    command: python -m processor.main
+    deploy:
+      replicas: 2
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: processor
+      WORKER_TIER: "3"
+
+  validator:
+    <<: *service-defaults
+    build: *worker-build
+    command: python -m validator.main
+    deploy:
+      replicas: 2
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: validator
+      WORKER_TIER: "4"
+
+  store:
+    <<: *service-defaults
+    build: *worker-build
+    command: python -m store.main
+    deploy:
+      replicas: 1
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      SERVICE_NAME: store
+      WORKER_TIER: "5"
+
+# -----------------------------------------------------------------------
+networks:
+  spider-net:
+    driver: bridge
+
+volumes:
+  redis_data:
+  pg_data:
